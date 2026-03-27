@@ -1,3 +1,6 @@
+import base64
+import mimetypes
+import os
 import re
 import traceback
 from datetime import datetime
@@ -6,14 +9,33 @@ from typing import Optional, Tuple
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from google import genai
+
 
 app = FastAPI()
 
+
+# =========================
+# GEMINI SETUP
+# =========================
+
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+gemini_client = None
+if gemini_api_key:
+    gemini_client = genai.Client(api_key=gemini_api_key)
+
+
+# =========================
+# MODELS
+# =========================
 
 class FlyerRequest(BaseModel):
     subject: Optional[str] = ""
     body: Optional[str] = ""
     attachment_name: Optional[str] = ""
+    attachment_content_base64: Optional[str] = ""
+    content_type: Optional[str] = ""
 
 
 class FlyerResponse(BaseModel):
@@ -30,16 +52,47 @@ class FlyerResponse(BaseModel):
     review_reason: Optional[str]
 
 
+# =========================
+# HEALTH CHECK
+# =========================
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
+# =========================
+# GEMINI TEST ENDPOINT
+# =========================
+
+@app.get("/gemini-test")
+async def gemini_test():
+    if not gemini_client:
+        return {"error": "Gemini client not initialized"}
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents="Say hello from Gemini"
+        )
+
+        return {
+            "success": True,
+            "response": response.text
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+# =========================
+# HELPERS
+# =========================
+
 def normalize_time(time_str: Optional[str]) -> Optional[str]:
-    """
-    Normalize a time string into HH:MM:SS 24-hour format when possible.
-    Returns None if parsing fails.
-    """
     if not time_str:
         return None
 
@@ -63,12 +116,6 @@ def normalize_time(time_str: Optional[str]) -> Optional[str]:
 
 
 def extract_title(subject: str, body: str, attachment_name: str) -> str:
-    """
-    Conservative title extraction:
-    1. Prefer subject if present and not generic
-    2. Fall back to attachment filename without extension
-    3. Fall back to first non-empty body line
-    """
     generic_subjects = {
         "",
         "flyer",
@@ -98,17 +145,9 @@ def extract_title(subject: str, body: str, attachment_name: str) -> str:
 
 
 def extract_date(text: str) -> Tuple[Optional[str], float]:
-    """
-    Attempts to extract a date from text.
-    Returns (YYYY-MM-DD, confidence)
-    """
-
     patterns = [
-        # March 30, 2026 / Mar 30 2026
         r"(?P<month>\b(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\b)\s+(?P<day>\d{1,2})(?:,)?\s+(?P<year>\d{2,4})",
-        # 03/30/2026 or 3/30/26
         r"(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{2,4})",
-        # 2026-03-30
         r"(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})",
     ]
 
@@ -142,17 +181,8 @@ def extract_date(text: str) -> Tuple[Optional[str], float]:
 
 
 def extract_time_range(text: str) -> Tuple[Optional[str], Optional[str], float]:
-    """
-    Placeholder-safe time extraction.
-    Tries to capture things like:
-    - 10:00 AM - 12:00 PM
-    - 10 AM to 12 PM
-    - 10:00-12:00 PM
-    Returns (start_time, end_time, confidence)
-    """
     patterns = [
         r"(?P<start>\d{1,2}(?::\d{2})?\s*[APap][Mm])\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}(?::\d{2})?\s*[APap][Mm])",
-        r"(?P<start>\d{1,2}(?::\d{2})?)\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}(?::\d{2})?\s*[APap][Mm])",
     ]
 
     for pattern in patterns:
@@ -173,14 +203,6 @@ def extract_time_range(text: str) -> Tuple[Optional[str], Optional[str], float]:
 
 
 def extract_location(text: str) -> Tuple[Optional[str], float]:
-    """
-    Placeholder-safe location extraction.
-    Conservative on purpose.
-    Looks for common location labels like:
-    Location: Orlando
-    Where: 123 Main St
-    Venue: Goodwill Campus
-    """
     patterns = [
         r"(?i)\bLocation:\s*(.+)",
         r"(?i)\bWhere:\s*(.+)",
@@ -200,30 +222,25 @@ def extract_location(text: str) -> Tuple[Optional[str], float]:
 
 
 def looks_like_event(text: str) -> bool:
-    """
-    Conservative event detection.
-    """
-    event_keywords = [
+    keywords = [
         "event",
         "workshop",
         "training",
         "meeting",
         "class",
         "seminar",
-        "webinar",
         "job fair",
         "hiring event",
         "open house",
-        "celebration",
-        "conference",
-        "networking",
-        "join us",
-        "register",
     ]
 
     text_lower = (text or "").lower()
-    return any(keyword in text_lower for keyword in event_keywords)
+    return any(k in text_lower for k in keywords)
 
+
+# =========================
+# MAIN PARSER
+# =========================
 
 @app.post("/parse-flyer", response_model=FlyerResponse)
 async def parse_flyer(payload: FlyerRequest):
@@ -253,7 +270,6 @@ async def parse_flyer(payload: FlyerRequest):
         if not start_time:
             review_reasons.append("No start time confidently extracted.")
 
-        # Safe fallbacks to preserve schema stability
         fallback_date = "2026-03-30"
         fallback_start_time = "10:00:00"
         fallback_end_time = "12:00:00"
@@ -270,7 +286,6 @@ async def parse_flyer(payload: FlyerRequest):
         confidence = round(min(confidence, 1.0), 2)
 
         needs_review = len(review_reasons) > 0
-
         review_reason = " ".join(review_reasons) if review_reasons else None
 
         return FlyerResponse(
@@ -292,7 +307,6 @@ async def parse_flyer(payload: FlyerRequest):
         print(str(e))
         traceback.print_exc()
 
-        # Return stable JSON even on failure
         return FlyerResponse(
             is_event=False,
             needs_review=True,
