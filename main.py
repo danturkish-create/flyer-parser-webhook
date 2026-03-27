@@ -1,5 +1,3 @@
-import base64
-import mimetypes
 import os
 import re
 import traceback
@@ -15,9 +13,8 @@ from google import genai
 app = FastAPI()
 
 
-# =========================
-# GEMINI SETUP
-# =========================
+APP_VERSION = "gemini-test-v1"
+
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
@@ -25,10 +22,6 @@ gemini_client = None
 if gemini_api_key:
     gemini_client = genai.Client(api_key=gemini_api_key)
 
-
-# =========================
-# MODELS
-# =========================
 
 class FlyerRequest(BaseModel):
     subject: Optional[str] = ""
@@ -52,45 +45,49 @@ class FlyerResponse(BaseModel):
     review_reason: Optional[str]
 
 
-# =========================
-# HEALTH CHECK
-# =========================
+@app.get("/")
+async def root():
+    return {"status": "ok", "app_version": APP_VERSION}
+
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "app_version": APP_VERSION}
 
 
-# =========================
-# GEMINI TEST ENDPOINT
-# =========================
+@app.get("/version")
+async def version():
+    return {"app_version": APP_VERSION}
+
 
 @app.get("/gemini-test")
 async def gemini_test():
     if not gemini_client:
-        return {"error": "Gemini client not initialized"}
+        return {
+            "success": False,
+            "error": "Gemini client not initialized",
+            "app_version": APP_VERSION,
+        }
 
     try:
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
-            contents="Say hello from Gemini"
+            contents="Say hello from Gemini in one short sentence."
         )
 
         return {
             "success": True,
-            "response": response.text
+            "response": response.text,
+            "app_version": APP_VERSION,
         }
 
     except Exception as e:
         return {
             "success": False,
-            "error": str(e)
+            "error": str(e),
+            "app_version": APP_VERSION,
         }
 
-
-# =========================
-# HELPERS
-# =========================
 
 def normalize_time(time_str: Optional[str]) -> Optional[str]:
     if not time_str:
@@ -237,10 +234,6 @@ def looks_like_event(text: str) -> bool:
     text_lower = (text or "").lower()
     return any(k in text_lower for k in keywords)
 
-
-# =========================
-# MAIN PARSER
-# =========================
 
 @app.post("/parse-flyer", response_model=FlyerResponse)
 async def parse_flyer(payload: FlyerRequest):
