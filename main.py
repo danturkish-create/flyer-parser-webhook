@@ -2,7 +2,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
-from openai import OpenAI
+import json
+from google import genai
 
 app = FastAPI()
 
@@ -14,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 @app.get("/")
 async def root():
@@ -32,9 +33,8 @@ async def parse_flyer(request: Request):
         prompt = f"""
 You extract structured event data from emails about public events.
 
-Return ONLY valid JSON.
+Return ONLY valid JSON with this exact schema:
 
-Schema:
 {{
   "is_event": true,
   "title": "",
@@ -50,21 +50,30 @@ Schema:
   "review_reason": ""
 }}
 
+Rules:
+- If this is not clearly an event, set "is_event" to false.
+- If details are missing or ambiguous, set "needs_review" to true.
+- Confidence must be an integer from 0 to 100.
+- Do not include markdown fences.
+- Do not include any text before or after the JSON.
+
 INPUT:
 Subject: {subject}
 Body: {body}
 Attachment: {attachment_name}
 """
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=prompt,
         )
 
-        content = response.choices[0].message.content
+        content = response.text.strip()
 
-        return JSONResponse(content={"raw_response": content})
+        # Validate that Gemini returned JSON
+        parsed = json.loads(content)
+
+        return JSONResponse(content=parsed)
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
