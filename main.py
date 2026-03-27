@@ -16,7 +16,7 @@ class FlyerRequest(BaseModel):
 
 
 # -----------------------------
-# Health Check (VERY IMPORTANT)
+# Health Check
 # -----------------------------
 @app.get("/health")
 def health():
@@ -40,14 +40,27 @@ def normalize_time(t: Optional[str]) -> Optional[str]:
 
 
 # -----------------------------
+# Helper: Extract Title
+# -----------------------------
+def extract_title(subject: Optional[str], body: Optional[str]) -> Optional[str]:
+    if body:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        for line in lines:
+            if len(line) > 3:
+                return line
+
+    if subject:
+        return subject.strip()
+
+    return None
+
+
+# -----------------------------
 # Main Endpoint
 # -----------------------------
 @app.post("/parse-flyer")
 async def parse_flyer(req: FlyerRequest):
     try:
-        # -----------------------------
-        # BASIC PARSING (replace later with AI)
-        # -----------------------------
         text = f"{req.subject or ''} {req.body or ''}".lower()
 
         parsed = {
@@ -65,17 +78,19 @@ async def parse_flyer(req: FlyerRequest):
         }
 
         # -----------------------------
-        # VERY SIMPLE EVENT DETECTION
+        # Basic event detection
         # -----------------------------
         if "am" in text or "pm" in text or ":" in text:
             parsed["is_event"] = True
             parsed["confidence"] = 0.6
 
         # -----------------------------
-        # DUMMY EXTRACTION (safe placeholders)
+        # Populate fields (IMPROVED TITLE)
         # -----------------------------
         if parsed["is_event"]:
-            parsed["title"] = req.subject or "Flyer Event"
+            parsed["title"] = extract_title(req.subject, req.body)
+
+            # Placeholder values (next step will replace these)
             parsed["start_date"] = "2026-03-30"
             parsed["start_time"] = "10:00"
             parsed["end_date"] = "2026-03-30"
@@ -83,13 +98,13 @@ async def parse_flyer(req: FlyerRequest):
             parsed["location"] = "Orlando"
 
         # -----------------------------
-        # Normalize times (SAFE)
+        # Normalize times safely
         # -----------------------------
         parsed["start_time"] = normalize_time(parsed.get("start_time"))
         parsed["end_time"] = normalize_time(parsed.get("end_time"))
 
         # -----------------------------
-        # If missing critical info → needs review
+        # Needs review check
         # -----------------------------
         if parsed["is_event"]:
             if not parsed["start_date"] or not parsed["start_time"]:
@@ -103,7 +118,6 @@ async def parse_flyer(req: FlyerRequest):
         print("🔥 PARSE ERROR:", str(e))
         print(traceback.format_exc())
 
-        # Always return valid JSON so Power Automate doesn't explode
         return {
             "is_event": False,
             "needs_review": True,
