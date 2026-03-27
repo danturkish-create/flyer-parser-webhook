@@ -73,9 +73,10 @@ Attachment: {attachment_name}
         # Validate that Gemini returned JSON
         parsed = json.loads(content)
 
-        if parsed.get("start_time") and len(parsed["start_time"]) == 5:
-    parsed["start_time"] = parsed["start_time"] + ":00"
-
+       if parsed.get("start_time") and ":" in parsed["start_time"]:
+    if len(parsed["start_time"].split(":")) == 2:
+        parsed["start_time"] = parsed["start_time"] + ":00"
+        
 if parsed.get("end_time") and len(parsed["end_time"]) == 5:
     parsed["end_time"] = parsed["end_time"] + ":00"
 
