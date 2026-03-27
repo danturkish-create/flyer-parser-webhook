@@ -247,14 +247,13 @@ async def parse_flyer(payload: FlyerRequest):
 
         review_reasons = []
 
-        if not date_value:
-            review_reasons.append("No date confidently extracted.")
+      review_reasons = []
 
-        if not start_time:
-            review_reasons.append("No start time confidently extracted.")
+if not date_value:
+    review_reasons.append("No date confidently extracted.")
 
-        if not location:
-            review_reasons.append("No location confidently extracted.")
+if not start_time:
+    review_reasons.append("No start time confidently extracted.")
 
         # Safe fallbacks to preserve schema stability
         fallback_date = "2026-03-30"
