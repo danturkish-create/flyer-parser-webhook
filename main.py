@@ -6,17 +6,17 @@ import re
 import traceback
 import uuid
 from datetime import datetime
-from typing import Optional, Tuple, Any, Dict
+from typing import Optional, Tuple, Any, List
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
 
 app = FastAPI()
 
-APP_VERSION = "gemini-flyer-parser-prod-v1"
+APP_VERSION = "gemini-flyer-parser-prod-v2"
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
@@ -70,6 +70,12 @@ class GeminiFlyerExtraction(BaseModel):
     description: Optional[str] = None
     confidence: Optional[float] = 0.0
     review_reason: Optional[str] = None
+
+    # New internal-only guidance fields
+    is_non_event_notice: bool = False
+    has_multiple_sessions: bool = False
+    session_count: Optional[int] = None
+    title_preserve_exact: Optional[str] = None
 
 
 # =========================
@@ -149,18 +155,18 @@ def log_error(request_id: str, message: str, **kwargs: Any) -> None:
         logger.error("[%s] %s", request_id, message)
 
 
+def compact_whitespace(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def strip_email_prefixes(text: str) -> str:
     if not text:
         return ""
     cleaned = text.strip()
     cleaned = re.sub(r"^(?:(?:fw|fwd|re)\s*:\s*)+", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
-
-
-def compact_whitespace(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def is_generic_title(text: str) -> bool:
@@ -179,6 +185,8 @@ def is_generic_title(text: str) -> bool:
         "scan",
         "document",
         "event",
+        "notice",
+        "announcement",
         "start_date",
         "<html><head>",
     }
@@ -196,13 +204,12 @@ def normalize_time(time_str: Optional[str]) -> Optional[str]:
     if not time_str:
         return None
 
-    cleaned = str(time_str).strip()
+    cleaned = compact_whitespace(str(time_str))
     if not cleaned:
         return None
 
     cleaned = cleaned.replace(".", "")
     cleaned = cleaned.replace("–", "-").replace("—", "-")
-    cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"(?i)(\d)(am|pm)\b", r"\1 \2", cleaned)
     cleaned_upper = cleaned.upper().strip()
 
@@ -244,7 +251,7 @@ def normalize_date(date_str: Optional[str]) -> Optional[str]:
     if not date_str:
         return None
 
-    cleaned = str(date_str).strip()
+    cleaned = compact_whitespace(str(date_str))
     if not cleaned:
         return None
 
@@ -298,17 +305,20 @@ def extract_title(subject: str, body: str, attachment_name: str) -> str:
         if attachment_base and not is_generic_title(attachment_base):
             return attachment_base[:150]
 
+    # Better body title detection
     for line in body_clean.splitlines():
         line = strip_email_prefixes(line.strip())
         if not line:
             continue
         if len(line) < 4:
             continue
-        if re.search(r"\b(am|pm)\b", line, re.IGNORECASE):
+        if re.search(r"\b(am|pm|noon|midnight)\b", line, re.IGNORECASE):
             continue
         if re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", line):
             continue
         if line.lower().startswith("<html"):
+            continue
+        if len(line) > 120:
             continue
         return line[:150]
 
@@ -359,8 +369,8 @@ def extract_time_range(text: str) -> Tuple[Optional[str], Optional[str], float]:
         return None, None, 0.0
 
     patterns = [
-        r"(?P<start>\d{1,2}(?::\d{2})?\s*[APap][Mm])\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}(?::\d{2})?\s*[APap][Mm])",
-        r"(?P<start>\d{1,2}(?::\d{2})?\s*[APap][Mm])\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}(?::\d{2})?)",
+        r"(?P<start>\b(?:Noon|Midnight)\b|\d{1,2}(?::\d{2})?\s*[APap][Mm])\s*(?:\-|–|—|to)\s*(?P<end>\b(?:Noon|Midnight)\b|\d{1,2}(?::\d{2})?\s*[APap][Mm])",
+        r"(?P<start>\b(?:Noon|Midnight)\b|\d{1,2}(?::\d{2})?\s*[APap][Mm])\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}(?::\d{2})?)",
         r"(?P<start>\d{1,2}:\d{2})\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}:\d{2})",
     ]
 
@@ -386,6 +396,26 @@ def extract_time_range(text: str) -> Tuple[Optional[str], Optional[str], float]:
     return None, None, 0.0
 
 
+def extract_start_only_time(text: str) -> Tuple[Optional[str], float]:
+    if not text:
+        return None, 0.0
+
+    patterns = [
+        r"(?i)\bstarts?\s+at\s+(?P<start>\d{1,2}(?::\d{2})?\s*[ap]m|noon|midnight)\b",
+        r"(?i)\bbegins?\s+at\s+(?P<start>\d{1,2}(?::\d{2})?\s*[ap]m|noon|midnight)\b",
+        r"(?i)\bstart\s*time\s*[:\-]?\s*(?P<start>\d{1,2}(?::\d{2})?\s*[ap]m|noon|midnight)\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            start_norm = normalize_time(match.group("start"))
+            if start_norm:
+                return start_norm, 0.65
+
+    return None, 0.0
+
+
 def extract_location(text: str) -> Tuple[Optional[str], float]:
     if not text:
         return None, 0.0
@@ -395,6 +425,7 @@ def extract_location(text: str) -> Tuple[Optional[str], float]:
         r"(?im)^\s*Where:\s*(.+)$",
         r"(?im)^\s*Venue:\s*(.+)$",
         r"(?im)^\s*Address:\s*(.+)$",
+        r"(?im)^\s*Place:\s*(.+)$",
     ]
 
     for pattern in label_patterns:
@@ -416,6 +447,18 @@ def extract_location(text: str) -> Tuple[Optional[str], float]:
     if match:
         return compact_whitespace(match.group(0))[:200], 0.8
 
+    # Venue-only / room-only fallback
+    venue_patterns = [
+        r"(?im)^\s*(?:Where|Venue|Location|Place)\s*[:\-]?\s*(.+)$",
+        r"(?im)^\s*(?:Room|Hall|Center|Lab|Library|Conference Room|Media Center|Training Hub)[^\n]{0,120}$",
+    ]
+    for pattern in venue_patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = compact_whitespace(match.group(1) if match.groups() else match.group(0))
+            if value and len(value) >= 3:
+                return value[:200], 0.6
+
     return None, 0.0
 
 
@@ -431,12 +474,84 @@ def looks_like_event(text: str) -> bool:
         "job fair",
         "resource fair",
         "hiring event",
+        "hiring day",
         "open house",
+        "clinic",
+        "bootcamp",
+        "session",
+        "orientation",
         "fair",
     ]
 
     text_lower = (text or "").lower()
     return any(keyword in text_lower for keyword in event_keywords)
+
+
+def looks_like_non_event_notice(text: str) -> bool:
+    if not text:
+        return False
+
+    text_lower = text.lower()
+
+    non_event_phrases = [
+        "internal awareness only",
+        "no public event",
+        "no registration",
+        "no attendees",
+        "office closed",
+        "building access unavailable",
+        "maintenance is in progress",
+        "notice only",
+        "for internal use only",
+        "closure notice",
+    ]
+
+    hits = sum(1 for phrase in non_event_phrases if phrase in text_lower)
+    return hits >= 2
+
+
+def count_distinct_date_mentions(text: str) -> int:
+    if not text:
+        return 0
+
+    patterns = [
+        r"\b(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+\d{1,2}(?:,\s*\d{2,4})?\b",
+        r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
+        r"\b\d{4}-\d{1,2}-\d{1,2}\b",
+    ]
+
+    matches = []
+    for pattern in patterns:
+        matches.extend(re.findall(pattern, text, flags=re.IGNORECASE))
+
+    normalized = set(compact_whitespace(m).lower() for m in matches if m)
+    return len(normalized)
+
+
+def looks_like_multi_session(text: str) -> bool:
+    if not text:
+        return False
+
+    text_lower = text.lower()
+
+    trigger_terms = [
+        "orientation",
+        "session",
+        "session 1",
+        "session 2",
+        "day 1",
+        "day 2",
+        "day 3",
+        "workshop days",
+        "attendance required all days",
+        "multiple sessions",
+        "schedule",
+    ]
+
+    has_trigger_term = any(term in text_lower for term in trigger_terms)
+    date_count = count_distinct_date_mentions(text)
+
+    return has_trigger_term and date_count >= 2
 
 
 def looks_like_real_file_bytes(data: bytes) -> bool:
@@ -574,6 +689,21 @@ def parse_gemini_response(parsed: Any) -> Optional[GeminiFlyerExtraction]:
     return None
 
 
+def simplify_gemini_error(error_text: str) -> str:
+    if not error_text:
+        return "Gemini extraction failed."
+
+    upper = error_text.upper()
+
+    if "429" in upper or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper:
+        return "Gemini quota exceeded; manual review required."
+
+    if "DEADLINE_EXCEEDED" in upper or "TIMEOUT" in upper:
+        return "Gemini timed out; manual review required."
+
+    return "Gemini extraction failed; manual review required."
+
+
 def extract_event_with_gemini(
     request_id: str,
     subject: str,
@@ -581,14 +711,14 @@ def extract_event_with_gemini(
     attachment_name: str,
     attachment_bytes: Optional[bytes],
     mime_type: str,
-) -> Tuple[Optional[GeminiFlyerExtraction], Optional[str]]:
+) -> Tuple[Optional[GeminiFlyerExtraction], Optional[str], Optional[str]]:
     if not gemini_client:
         log_warning(request_id, "Gemini client missing")
-        return None, "Gemini client not initialized."
+        return None, "Gemini client not initialized.", "Gemini unavailable; manual review required."
 
     if not attachment_bytes:
         log_warning(request_id, "No attachment bytes available for Gemini")
-        return None, "No attachment bytes available."
+        return None, "No attachment bytes available.", "Attachment could not be decoded."
 
     prompt = f"""
 Extract event information from this flyer attachment and the surrounding email context.
@@ -598,16 +728,22 @@ Return only structured data matching the provided schema.
 Important rules:
 - Prefer the flyer attachment over the email subject.
 - Ignore email prefixes like FW:, FWD:, and RE: when choosing the title.
-- The title should be the actual event title from the flyer, not the email subject.
+- Preserve the visible flyer title as exactly as practical.
+- If the flyer title is bilingual, keep both languages when clearly shown.
+- Do not use generic headers like "flyer", "event", or a file name as the event title if a better title exists on the flyer.
 - If the flyer says "10AM - 2PM", return start_time as "10:00:00" and end_time as "14:00:00".
+- If the flyer says "Noon", return "12:00:00".
 - Return start_date and end_date in YYYY-MM-DD format when possible.
 - Return times in HH:MM:SS 24-hour format when possible.
-- For location, include the venue and street address if clearly visible.
+- For location, include the venue and street address if clearly visible. Venue-only locations are acceptable if that is all the flyer provides.
 - Be conservative. Do not invent details.
 - confidence must be between 0.0 and 1.0.
 - description should be short and useful.
-- If this is not actually an event flyer, set is_event to false.
+- If this is not actually an event flyer, set is_event to false and is_non_event_notice to true when appropriate.
+- If the flyer appears to contain multiple distinct sessions, dates, or schedule blocks, set has_multiple_sessions to true.
+- A flyer with multiple distinct sessions should not be flattened into one continuous event.
 - If key details are unclear, explain briefly in review_reason.
+- If the image is blank or contains no useful flyer content, set is_event to false.
 
 Email subject:
 {subject}
@@ -658,8 +794,11 @@ Attachment name:
                 location=parsed.location,
                 confidence=parsed.confidence,
                 review_reason=parsed.review_reason,
+                is_non_event_notice=parsed.is_non_event_notice,
+                has_multiple_sessions=parsed.has_multiple_sessions,
+                session_count=parsed.session_count,
             )
-            return parsed, None
+            return parsed, None, None
 
         raw_text = getattr(response, "text", None)
         log_warning(
@@ -667,11 +806,13 @@ Attachment name:
             "Gemini returned no parsed result",
             raw_text_preview=(raw_text[:500] if raw_text else None),
         )
-        return None, "Gemini returned no structured result."
+        return None, "Gemini returned no structured result.", "Gemini returned no structured result; manual review required."
 
     except Exception as e:
-        log_warning(request_id, "Gemini extraction failed", error=str(e))
-        return None, f"Gemini extraction failed: {str(e)}"
+        raw_error = str(e)
+        clean_error = simplify_gemini_error(raw_error)
+        log_warning(request_id, "Gemini extraction failed", error=raw_error)
+        return None, raw_error, clean_error
 
 
 def build_review_response(
@@ -702,7 +843,7 @@ def build_review_response(
     )
 
 
-def dedupe_review_reasons(reasons: list[str]) -> str:
+def dedupe_review_reasons(reasons: List[str]) -> str:
     seen = set()
     ordered = []
     for reason in reasons:
@@ -725,6 +866,7 @@ async def parse_flyer(payload: FlyerRequest):
     request_id = make_request_id()
 
     try:
+        # Request-local values only
         subject = payload.subject or ""
         body = payload.body or ""
         attachment_name = payload.attachment_name or ""
@@ -742,7 +884,6 @@ async def parse_flyer(payload: FlyerRequest):
 
         subject_clean = strip_email_prefixes(subject)
         description_default = compact_whitespace(body) or subject_clean or ""
-
         title = extract_title(subject_clean, body, attachment_name)
 
         attachment_bytes, decode_status = decode_attachment_base64(attachment_content_base64, request_id)
@@ -766,15 +907,24 @@ async def parse_flyer(payload: FlyerRequest):
             if part
         ).strip()
 
+        # Fallback extraction from email/body context only
         date_value, date_conf = extract_date(full_text)
         start_time, end_time, time_conf = extract_time_range(full_text)
+
+        if not start_time:
+            start_only_time, start_only_conf = extract_start_only_time(full_text)
+            if start_only_time:
+                start_time = start_only_time
+                time_conf = max(time_conf, start_only_conf)
+
         location, location_conf = extract_location(full_text)
 
         gemini_result = None
-        gemini_error = None
+        gemini_error_raw = None
+        gemini_error_clean = None
 
         if attachment_bytes:
-            gemini_result, gemini_error = extract_event_with_gemini(
+            gemini_result, gemini_error_raw, gemini_error_clean = extract_event_with_gemini(
                 request_id=request_id,
                 subject=subject_clean,
                 body=body,
@@ -783,14 +933,21 @@ async def parse_flyer(payload: FlyerRequest):
                 mime_type=mime_type,
             )
         else:
-            gemini_error = "Attachment could not be decoded."
+            gemini_error_clean = "Attachment could not be decoded."
 
         gemini_conf = 0.0
         gemini_review_reason = None
         gemini_end_date = None
 
+        # Internal review flags
+        multiple_sessions_detected = looks_like_multi_session(full_text)
+        non_event_notice_detected = looks_like_non_event_notice(full_text)
+        blank_or_junk_detected = False
+
         if gemini_result:
-            if gemini_result.title and not is_generic_title(gemini_result.title):
+            if gemini_result.title_preserve_exact and not is_generic_title(gemini_result.title_preserve_exact):
+                title = compact_whitespace(gemini_result.title_preserve_exact)[:150]
+            elif gemini_result.title and not is_generic_title(gemini_result.title):
                 title = compact_whitespace(gemini_result.title)[:150]
 
             description = compact_whitespace(gemini_result.description or description_default)
@@ -816,14 +973,28 @@ async def parse_flyer(payload: FlyerRequest):
 
             if gemini_result.location:
                 location = compact_whitespace(gemini_result.location)[:200]
-                location_conf = max(location_conf, 0.9)
+                # Venue-only locations are acceptable
+                location_conf = max(location_conf, 0.6 if "," not in location else 0.9)
 
-            is_event = bool(gemini_result.is_event) or bool(date_value) or looks_like_event(full_text)
             gemini_conf = float(gemini_result.confidence or 0.0)
             gemini_review_reason = gemini_result.review_reason
+
+            multiple_sessions_detected = multiple_sessions_detected or bool(gemini_result.has_multiple_sessions)
+            non_event_notice_detected = non_event_notice_detected or bool(gemini_result.is_non_event_notice)
+
+            is_event = bool(gemini_result.is_event) or bool(date_value) or looks_like_event(full_text)
         else:
             description = description_default
             is_event = looks_like_event(full_text) or bool(date_value)
+
+        # Blank / junk protection
+        if not gemini_result and not body.strip() and not subject_clean.strip():
+            if attachment_name and re.search(r"\b(blank|empty|white|scan)\b", attachment_name, re.IGNORECASE):
+                blank_or_junk_detected = True
+
+        # Non-event notice override
+        if non_event_notice_detected:
+            is_event = False
 
         title = strip_email_prefixes(title)
         if is_generic_title(title):
@@ -831,10 +1002,12 @@ async def parse_flyer(payload: FlyerRequest):
             attachment_base = strip_email_prefixes(attachment_base)
             if attachment_base and not is_generic_title(attachment_base):
                 title = attachment_base[:150]
+            elif gemini_result and gemini_result.title and not is_generic_title(gemini_result.title):
+                title = compact_whitespace(gemini_result.title)[:150]
             else:
                 title = "flyer"
 
-        review_reasons: list[str] = []
+        review_reasons: List[str] = []
 
         if decode_status in {"missing", "empty"}:
             review_reasons.append("Attachment content is missing or empty.")
@@ -843,8 +1016,11 @@ async def parse_flyer(payload: FlyerRequest):
         elif decode_status in {"single_decode_non_signature_bytes", "double_decode_non_signature_bytes"}:
             review_reasons.append("Attachment decoded, but file signature could not be confirmed.")
 
-        if gemini_error:
-            review_reasons.append(gemini_error)
+        if gemini_error_clean:
+            review_reasons.append(gemini_error_clean)
+
+        if multiple_sessions_detected:
+            review_reasons.append("Multiple distinct event sessions detected; review before calendar creation.")
 
         if is_event and not date_value:
             review_reasons.append("No date confidently extracted.")
@@ -855,6 +1031,9 @@ async def parse_flyer(payload: FlyerRequest):
         if is_event and not location:
             review_reasons.append("No location confidently extracted.")
 
+        if is_event and start_time and not end_time:
+            review_reasons.append("No end time confidently extracted.")
+
         if gemini_review_reason:
             review_reasons.append(gemini_review_reason)
 
@@ -864,9 +1043,7 @@ async def parse_flyer(payload: FlyerRequest):
         end_time_final = end_time or ""
         location_final = location or ""
 
-        if start_time_final and not end_time_final:
-            review_reasons.append("No end time confidently extracted.")
-
+        # Confidence handling
         confidence_candidates = [
             date_conf,
             time_conf,
@@ -874,10 +1051,26 @@ async def parse_flyer(payload: FlyerRequest):
             gemini_conf,
             0.6 if is_event else 0.2,
         ]
-        confidence = round(min(max(confidence_candidates), 1.0), 2)
+        confidence = round(min(max(confidence_candidates), 0.99), 2)
 
-        needs_review = len(review_reasons) > 0
-        review_reason = dedupe_review_reasons(review_reasons) if review_reasons else None
+        # Final routing policy
+        if blank_or_junk_detected and not is_event:
+            needs_review = False
+            review_reason = None
+        elif non_event_notice_detected and not is_event and not gemini_error_clean:
+            needs_review = False
+            review_reason = None
+        else:
+            needs_review = len(review_reasons) > 0
+            review_reason = dedupe_review_reasons(review_reasons) if review_reasons else None
+
+        # If no signal at all and looks like junk, suppress event status
+        if not date_value and not start_time and not location and not looks_like_event(full_text) and non_event_notice_detected:
+            is_event = False
+
+        # If Gemini unavailable and we only know nothing, be conservative
+        if gemini_error_clean and not date_value and not start_time and not location and not looks_like_event(full_text):
+            is_event = False
 
         log_info(
             request_id,
@@ -892,6 +1085,8 @@ async def parse_flyer(payload: FlyerRequest):
             needs_review=needs_review,
             confidence=confidence,
             review_reason=review_reason,
+            multiple_sessions_detected=multiple_sessions_detected,
+            non_event_notice_detected=non_event_notice_detected,
         )
 
         return FlyerResponse(
@@ -925,5 +1120,5 @@ async def parse_flyer(payload: FlyerRequest):
             end_time="",
             location="",
             confidence=0.0,
-            review_reason=f"Parser exception: {str(e)}",
+            review_reason="Parser exception; manual review required.",
         )
