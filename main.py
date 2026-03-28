@@ -14,7 +14,7 @@ from google.genai import types
 
 app = FastAPI()
 
-APP_VERSION = "gemini-ocr-final-v5"
+APP_VERSION = "gemini-ocr-finaltimefix-v5"
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
@@ -152,18 +152,19 @@ def normalize_time(time_str: Optional[str]) -> Optional[str]:
     if not time_str:
         return None
 
-    cleaned = time_str.strip()
+    cleaned = str(time_str).strip()
     cleaned = cleaned.replace(".", "")
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"(?i)(\d)(am|pm)\b", r"\1 \2", cleaned)
     cleaned = cleaned.upper().strip()
 
     formats = [
-        "%I:%M %p",
-        "%I %p",
-        "%H:%M:%S",
-        "%H:%M",
-        "%H%M",
+        "%H:%M:%S",      # 14:00:00
+        "%I:%M:%S %p",   # 10:00:00 AM
+        "%I:%M %p",      # 10:00 AM
+        "%I %p",         # 10 AM
+        "%H:%M",         # 14:00
+        "%H%M",          # 1400
     ]
 
     for fmt in formats:
@@ -180,7 +181,7 @@ def normalize_date(date_str: Optional[str]) -> Optional[str]:
     if not date_str:
         return None
 
-    cleaned = date_str.strip()
+    cleaned = str(date_str).strip()
 
     formats = [
         "%Y-%m-%d",
@@ -574,4 +575,119 @@ async def parse_flyer(payload: FlyerRequest):
         location, location_conf = extract_location(full_text)
 
         gemini_conf = 0.0
-        gem
+        gemini_review_reason = None
+        gemini_end_date = None
+
+        if gemini_result:
+            if gemini_result.title and not is_generic_title(gemini_result.title):
+                title = gemini_result.title.strip()[:150]
+
+            if gemini_result.description:
+                description = gemini_result.description.strip()
+
+            gem_date = normalize_date(gemini_result.start_date)
+            if gem_date:
+                date_value = gem_date
+                date_conf = max(date_conf, 0.95)
+
+            gem_end_date = normalize_date(gemini_result.end_date)
+            if gem_end_date:
+                gemini_end_date = gem_end_date
+
+            gem_start_time = normalize_time(gemini_result.start_time)
+            if gem_start_time:
+                start_time = gem_start_time
+                time_conf = max(time_conf, 0.95)
+
+            gem_end_time = normalize_time(gemini_result.end_time)
+            if gem_end_time:
+                end_time = gem_end_time
+                time_conf = max(time_conf, 0.95)
+
+            if gemini_result.location:
+                location = gemini_result.location.strip()[:200]
+                location_conf = max(location_conf, 0.9)
+
+            is_event = bool(gemini_result.is_event) or bool(date_value) or looks_like_event(full_text)
+            gemini_conf = float(gemini_result.confidence or 0.0)
+            gemini_review_reason = gemini_result.review_reason
+        else:
+            is_event = looks_like_event(full_text) or bool(date_value)
+
+        title = strip_email_prefixes(title)
+        if is_generic_title(title):
+            attachment_base = re.sub(r"\.[A-Za-z0-9]+$", "", attachment_name or "").strip()
+            if attachment_base and not is_generic_title(attachment_base):
+                title = attachment_base[:150]
+            else:
+                title = "flyer"
+
+        review_reasons = []
+
+        if not date_value:
+            review_reasons.append("No date confidently extracted.")
+
+        if not start_time:
+            review_reasons.append("No start time confidently extracted.")
+
+        if gemini_review_reason:
+            review_reasons.append(gemini_review_reason)
+
+        fallback_date = "2026-03-30"
+        fallback_start_time = "10:00:00"
+        fallback_end_time = "12:00:00"
+        fallback_location = "Orlando"
+
+        start_date = date_value if date_value else fallback_date
+        end_date = gemini_end_date if gemini_end_date else start_date
+
+        start_time_final = start_time if start_time else fallback_start_time
+        end_time_final = end_time if end_time else fallback_end_time
+        location_final = location if location else fallback_location
+
+        confidence = max(date_conf, time_conf, location_conf, gemini_conf, 0.6 if is_event else 0.2)
+        confidence = round(min(confidence, 1.0), 2)
+
+        needs_review = len(review_reasons) > 0
+        review_reason = " ".join(review_reasons) if review_reasons else None
+
+        print(
+            f"DEBUG: final result -> "
+            f"is_event={is_event}, title={title}, start_date={start_date}, "
+            f"start_time={start_time_final}, end_time={end_time_final}, "
+            f"location={location_final}, needs_review={needs_review}, "
+            f"review_reason={review_reason}, confidence={confidence}"
+        )
+
+        return FlyerResponse(
+            is_event=is_event,
+            needs_review=needs_review,
+            title=title,
+            start_date=start_date,
+            start_time=start_time_final,
+            end_date=end_date,
+            end_time=end_time_final,
+            location=location_final,
+            description=description,
+            confidence=confidence,
+            review_reason=review_reason,
+        )
+
+    except Exception as e:
+        print("ERROR in /parse-flyer")
+        print(str(e))
+        traceback.print_exc()
+
+        return FlyerResponse(
+            is_event=False,
+            needs_review=True,
+            title="flyer",
+            start_date="2026-03-30",
+            start_time="10:00:00",
+            end_date="2026-03-30",
+            end_time="12:00:00",
+            location="Orlando",
+            description="Parsing failed.",
+            confidence=0.0,
+            review_reason=f"Parser exception: {str(e)}",
+        )
