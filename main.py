@@ -14,7 +14,7 @@ from google.genai import types
 
 app = FastAPI()
 
-APP_VERSION = "gemini-ocr-debug-v3"
+APP_VERSION = "gemini-ocr-doubledecode-v4"
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
@@ -136,6 +136,7 @@ def is_generic_title(text: str) -> bool:
         "scan",
         "document",
         "start_date",
+        "<html><head>",
     }
 
     if normalized in generic_values:
@@ -236,6 +237,8 @@ def extract_title(subject: str, body: str, attachment_name: str) -> str:
         if re.search(r"\b(am|pm)\b", line, re.IGNORECASE):
             continue
         if re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", line):
+            continue
+        if line.lower().startswith("<html"):
             continue
         return line[:150]
 
@@ -368,15 +371,86 @@ def guess_mime_type(attachment_name: str, content_type: str) -> str:
     return guessed or "application/octet-stream"
 
 
+def looks_like_real_file_bytes(data: bytes) -> bool:
+    if not data or len(data) < 4:
+        return False
+
+    signatures = [
+        b"\xff\xd8\xff",          # jpg
+        b"\x89PNG\r\n\x1a\n",     # png
+        b"%PDF",                  # pdf
+        b"GIF87a",
+        b"GIF89a",
+        b"BM",                    # bmp
+        b"II*\x00",               # tiff
+        b"MM\x00*",               # tiff
+    ]
+
+    return any(data.startswith(sig) for sig in signatures)
+
+
+def looks_like_base64_text(data: bytes) -> bool:
+    if not data:
+        return False
+
+    try:
+        text = data.decode("utf-8", errors="strict").strip()
+    except Exception:
+        return False
+
+    if not text:
+        return False
+
+    # Remove whitespace/newlines before checking
+    compact = re.sub(r"\s+", "", text)
+
+    # Base64 alphabet only
+    if re.fullmatch(r"[A-Za-z0-9+/=]+", compact) is None:
+        return False
+
+    return len(compact) > 100
+
+
 def decode_attachment_base64(data: Optional[str]) -> Optional[bytes]:
     if not data:
         return None
 
     try:
-        if "," in data and data.lower().startswith("data:"):
-            data = data.split(",", 1)[1]
-        return base64.b64decode(data)
-    except Exception:
+        working = data.strip()
+
+        # Remove wrapping quotes if present
+        if working.startswith('"') and working.endswith('"'):
+            working = working[1:-1]
+
+        # Handle data URL prefix
+        if "," in working and working.lower().startswith("data:"):
+            working = working.split(",", 1)[1]
+
+        # First decode
+        first_pass = base64.b64decode(working)
+        print(f"DEBUG: first decode length={len(first_pass)}")
+
+        if looks_like_real_file_bytes(first_pass):
+            print("DEBUG: first decode looks like real file bytes")
+            return first_pass
+
+        # If first pass looks like base64 text, decode again
+        if looks_like_base64_text(first_pass):
+            print("DEBUG: first decode looks like base64 text, attempting second decode")
+            compact = re.sub(r"\s+", "", first_pass.decode('utf-8', errors='strict'))
+            second_pass = base64.b64decode(compact)
+            print(f"DEBUG: second decode length={len(second_pass)}")
+
+            if looks_like_real_file_bytes(second_pass):
+                print("DEBUG: second decode looks like real file bytes")
+                return second_pass
+
+            return second_pass
+
+        return first_pass
+
+    except Exception as e:
+        print(f"DEBUG: decode_attachment_base64 failed: {str(e)}")
         return None
 
 
