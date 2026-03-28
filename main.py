@@ -14,7 +14,7 @@ from google.genai import types
 
 app = FastAPI()
 
-APP_VERSION = "gemini-ocr-v2"
+APP_VERSION = "gemini-ocr-debug-v3"
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
@@ -135,6 +135,7 @@ def is_generic_title(text: str) -> bool:
         "photo",
         "scan",
         "document",
+        "start_date",
     }
 
     if normalized in generic_values:
@@ -196,7 +197,6 @@ def normalize_date(date_str: Optional[str]) -> Optional[str]:
         except ValueError:
             continue
 
-    # Month name regex fallback
     match = re.search(
         r"(?i)\b(Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\b\s+(\d{1,2})(?:,)?\s+(\d{2,4})",
         cleaned,
@@ -286,9 +286,7 @@ def extract_time_range(text: str) -> Tuple[Optional[str], Optional[str], float]:
         return None, None, 0.0
 
     patterns = [
-        # 10AM - 2PM / 10 AM - 2 PM / 10:00AM - 2:00PM
         r"(?P<start>\d{1,2}(?::\d{2})?\s*[APap][Mm])\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}(?::\d{2})?\s*[APap][Mm])",
-        # 10:00 - 14:00
         r"(?P<start>\d{1,2}:\d{2})\s*(?:\-|–|—|to)\s*(?P<end>\d{1,2}:\d{2})",
     ]
 
@@ -339,32 +337,6 @@ def extract_location(text: str) -> Tuple[Optional[str], float]:
     if match:
         return match.group(0).strip()[:200], 0.8
 
-    virtual_patterns = [
-        r"\bzoom\b",
-        r"\bvirtual\b",
-        r"\bonline\b",
-        r"\bgoogle meet\b",
-        r"\bmicrosoft teams\b",
-        r"\bteams\b",
-        r"\bwebex\b",
-    ]
-
-    for pattern in virtual_patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return "Virtual", 0.75
-
-    room_patterns = [
-        r"\bRoom\s+\w+\b",
-        r"\bSuite\s+\w+\b",
-        r"\bBuilding\s+\w+\b",
-        r"\bConference Room\s+\w+\b",
-    ]
-
-    for pattern in room_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(0).strip()[:200], 0.6
-
     return None, 0.0
 
 
@@ -381,11 +353,6 @@ def looks_like_event(text: str) -> bool:
         "resource fair",
         "hiring event",
         "open house",
-        "celebration",
-        "conference",
-        "networking",
-        "join us",
-        "register",
         "fair",
     ]
 
@@ -406,7 +373,6 @@ def decode_attachment_base64(data: Optional[str]) -> Optional[bytes]:
         return None
 
     try:
-        # Handle possible data URL prefix
         if "," in data and data.lower().startswith("data:"):
             data = data.split(",", 1)[1]
         return base64.b64decode(data)
@@ -421,8 +387,15 @@ def extract_event_with_gemini(
     attachment_bytes: Optional[bytes],
     mime_type: str,
 ) -> Optional[GeminiFlyerExtraction]:
-    if not gemini_client or not attachment_bytes:
+    if not gemini_client:
+        print("DEBUG: Gemini client missing")
         return None
+
+    if not attachment_bytes:
+        print("DEBUG: No attachment bytes available for Gemini")
+        return None
+
+    print(f"DEBUG: Calling Gemini with attachment_name={attachment_name}, mime_type={mime_type}, bytes={len(attachment_bytes)}")
 
     prompt = f"""
 Extract event information from this flyer attachment and the surrounding email context.
@@ -469,12 +442,14 @@ Attachment name:
         )
 
         if getattr(response, "parsed", None):
+            print(f"DEBUG: Gemini parsed result={response.parsed}")
             return response.parsed
 
+        print(f"DEBUG: Gemini returned no parsed result. Raw text={getattr(response, 'text', None)}")
         return None
 
     except Exception as e:
-        print("Gemini extraction failed:", str(e))
+        print(f"DEBUG: Gemini extraction failed: {str(e)}")
         return None
 
 
@@ -491,9 +466,18 @@ async def parse_flyer(payload: FlyerRequest):
         attachment_content_base64 = payload.attachment_content_base64 or ""
         content_type = payload.content_type or ""
 
+        print("DEBUG: /parse-flyer called")
+        print(f"DEBUG: subject={subject}")
+        print(f"DEBUG: attachment_name={attachment_name}")
+        print(f"DEBUG: content_type={content_type}")
+        print(f"DEBUG: attachment_content_base64 length={len(attachment_content_base64) if attachment_content_base64 else 0}")
+
         subject_clean = strip_email_prefixes(subject)
         attachment_bytes = decode_attachment_base64(attachment_content_base64)
         mime_type = guess_mime_type(attachment_name, content_type)
+
+        print(f"DEBUG: decoded attachment bytes={len(attachment_bytes) if attachment_bytes else 0}")
+        print(f"DEBUG: resolved mime_type={mime_type}")
 
         gemini_result = extract_event_with_gemini(
             subject=subject_clean,
@@ -513,7 +497,6 @@ async def parse_flyer(payload: FlyerRequest):
             if part
         ).strip()
 
-        # Local fallback values from plain text/email context
         title = extract_title(subject_clean, body, attachment_name)
         description = body.strip() if body.strip() else subject_clean.strip()
 
@@ -561,14 +544,11 @@ async def parse_flyer(payload: FlyerRequest):
         else:
             is_event = looks_like_event(full_text) or bool(date_value)
 
-        # Final cleanup on title in case subject was junk
         title = strip_email_prefixes(title)
         if is_generic_title(title):
             attachment_base = re.sub(r"\.[A-Za-z0-9]+$", "", attachment_name or "").strip()
             if attachment_base and not is_generic_title(attachment_base):
                 title = attachment_base[:150]
-            elif gemini_result and gemini_result.title:
-                title = strip_email_prefixes(gemini_result.title)[:150]
             else:
                 title = "flyer"
 
@@ -583,7 +563,6 @@ async def parse_flyer(payload: FlyerRequest):
         if gemini_review_reason:
             review_reasons.append(gemini_review_reason)
 
-        # Stable fallbacks for schema consistency
         fallback_date = "2026-03-30"
         fallback_start_time = "10:00:00"
         fallback_end_time = "12:00:00"
@@ -601,6 +580,14 @@ async def parse_flyer(payload: FlyerRequest):
 
         needs_review = len(review_reasons) > 0
         review_reason = " ".join(review_reasons) if review_reasons else None
+
+        print(
+            f"DEBUG: final result -> "
+            f"is_event={is_event}, title={title}, start_date={start_date}, "
+            f"start_time={start_time_final}, end_time={end_time_final}, "
+            f"location={location_final}, needs_review={needs_review}, "
+            f"review_reason={review_reason}, confidence={confidence}"
+        )
 
         return FlyerResponse(
             is_event=is_event,
